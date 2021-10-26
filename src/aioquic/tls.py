@@ -329,6 +329,7 @@ def verify_certificate(
         raise AlertBadCertificate(err_str)
 
 
+
 class CipherSuite(IntEnum):
     AES_128_GCM_SHA256 = 0x1301
     AES_256_GCM_SHA384 = 0x1302
@@ -408,6 +409,27 @@ class SignatureAlgorithm(IntEnum):
     SHA1_DSA = 0x0202
     ECDSA_SHA1 = 0x0203
 
+def certificate_signature_algorithms(certificate_private_key: Union[
+        dsa.DSAPrivateKey, ec.EllipticCurvePrivateKey, rsa.RSAPrivateKey
+]) -> List[SignatureAlgorithm]:
+
+    signature_algorithms: List[SignatureAlgorithm] = []
+    if isinstance(certificate_private_key, rsa.RSAPrivateKey):
+        signature_algorithms = [
+            SignatureAlgorithm.RSA_PSS_RSAE_SHA256,
+            SignatureAlgorithm.RSA_PKCS1_SHA256,
+            SignatureAlgorithm.RSA_PKCS1_SHA1,
+        ]
+    elif isinstance(
+        certificate_private_key, ec.EllipticCurvePrivateKey
+    ) and isinstance(certificate_private_key.curve, ec.SECP256R1):
+        signature_algorithms = [SignatureAlgorithm.ECDSA_SECP256R1_SHA256]
+    elif isinstance(certificate_private_key, ed25519.Ed25519PrivateKey):
+        signature_algorithms = [SignatureAlgorithm.ED25519]
+    elif isinstance(certificate_private_key, ed448.Ed448PrivateKey):
+        signature_algorithms = [SignatureAlgorithm.ED448]
+
+    return signature_algorithms
 
 # BLOCKS
 
@@ -945,6 +967,44 @@ def push_certificate_verify(buf: Buffer, verify: CertificateVerify) -> None:
 
 
 @dataclass
+class CertificateRequest:
+    certificate_request_context: bytes
+    #  Extensions
+    signature_algorithms: Optional[List[int]] = None
+
+    # TODO
+    # Missing extension support:
+    # 1) status_request,
+    # 2) signed_certificate_timestamp,
+    # 3) certificate_authorities,
+    # 4) oid_filters
+    # 5) signature_algorithms_cert
+    other_extensions : List[Extension] = field(default_factory=list)
+
+def pull_certificate_request(buf: Buffer) -> CertificateRequest:
+    assert buf.pull_uint8() == HandshakeType.CERTIFICATE_REQUEST
+
+    certificate_request = CertificateRequest()
+    certificate_request.certificate_request_context = pull_opaque(buf, 1)
+
+    def pull_extension() -> None:
+        extension_type = buf.pull_uint16()
+        extension_length = buf.pull_uint16()
+
+        if extension_type == ExtensionType.SIGNATURE_ALGORITHMS:
+            certificate_request.signature_algorithms = pull_list(buf, 2,
+                                                                 buf.pull_uint16)
+        else:
+            certificate_request.other_extensions.append(
+                (extension_type, buf.pull_bytes(extension_length))
+            )
+
+    pull_list(buf, 2, pull_extension)
+
+    return certificate_request
+
+
+@dataclass
 class Finished:
     verify_data: bytes = b""
 
@@ -1177,6 +1237,18 @@ AlpnHandler = Callable[[str], None]
 SessionTicketFetcher = Callable[[bytes], Optional[SessionTicket]]
 SessionTicketHandler = Callable[[SessionTicket], None]
 
+# TODO(jls) - For client
+# 1. Add configuration for client certificates to use. [DONE]
+# 2. Read CertificateRequest. [DONE]
+# 3. Respond with Certificate. [DONE]
+# 4. Respond with CertificateVerify. [DONE]
+# 5. Respond with Finished. [DONE]
+
+# TODO(jls) - For server
+# 1. Add an option to identify if we need to require certificates or not.
+# 2. Send Certificate Request
+# 3. Receive and validate Certificate, CertificateVerify.
+
 
 class Context:
     def __init__(
@@ -1323,8 +1395,8 @@ class Context:
                 if message_type == HandshakeType.CERTIFICATE:
                     self._client_handle_certificate(input_buf)
                 else:
-                    # FIXME: handle certificate request
-                    raise AlertUnexpectedMessage
+                    self._client_handle_certificate_request(input_buf,
+                                                            output_buf[Epoch.HANDSHAKE])
             elif self.state == State.CLIENT_EXPECT_CERTIFICATE_VERIFY:
                 if message_type == HandshakeType.CERTIFICATE_VERIFY:
                     self._client_handle_certificate_verify(input_buf)
@@ -1575,6 +1647,53 @@ class Context:
 
         self._set_state(State.CLIENT_EXPECT_CERTIFICATE_VERIFY)
 
+    def _client_handle_certificate_request(self, input_buf: Buffer, output_buf: Buffer) -> None:
+        cert_request = pull_certificate_request(input_buf)
+        signature_algorithms: List[SignatureAlgorithm] = certificate_signature_algorithms(self.certificate_private_key)
+
+        signature_algorithm = negotiate(
+            signature_algorithms,
+            cert_request.signature_algorithms,
+            AlertHandshakeFailure("No supported signature algorithm"),
+        )
+
+        with push_message(self.key_schedule, output_buf):
+            push_certificate(
+                output_buf,
+                Certificate(
+                    request_context=b"",
+                    certificates=[
+                        (x.public_bytes(Encoding.DER), b"")
+                        for x in [self.certificate]
+                    ],
+                ),
+            )
+
+        signature = self.certificate_private_key.sign(
+            self.key_schedule.certificate_verify_data(
+                b"TLS 1.3, client CertificateVerify"
+            ),
+            *signature_algorithm_params(signature_algorithm),
+        )
+
+        with push_message(self.key_schedule, output_buf):
+            push_certificate_verify(
+                output_buf,
+                CertificateVerify(
+                    algorithm=signature_algorithm, signature=signature
+                ),
+            )
+
+
+        # send finished
+        with push_message(self.key_schedule, output_buf):
+            push_finished(
+                output_buf,
+                Finished(
+                    verify_data=self.key_schedule.finished_verify_data(self._enc_key)
+                ),
+            )
+
     def _client_handle_certificate_verify(self, input_buf: Buffer) -> None:
         verify = pull_certificate_verify(input_buf)
 
@@ -1664,21 +1783,7 @@ class Context:
         peer_hello = pull_client_hello(input_buf)
 
         # determine applicable signature algorithms
-        signature_algorithms: List[SignatureAlgorithm] = []
-        if isinstance(self.certificate_private_key, rsa.RSAPrivateKey):
-            signature_algorithms = [
-                SignatureAlgorithm.RSA_PSS_RSAE_SHA256,
-                SignatureAlgorithm.RSA_PKCS1_SHA256,
-                SignatureAlgorithm.RSA_PKCS1_SHA1,
-            ]
-        elif isinstance(
-            self.certificate_private_key, ec.EllipticCurvePrivateKey
-        ) and isinstance(self.certificate_private_key.curve, ec.SECP256R1):
-            signature_algorithms = [SignatureAlgorithm.ECDSA_SECP256R1_SHA256]
-        elif isinstance(self.certificate_private_key, ed25519.Ed25519PrivateKey):
-            signature_algorithms = [SignatureAlgorithm.ED25519]
-        elif isinstance(self.certificate_private_key, ed448.Ed448PrivateKey):
-            signature_algorithms = [SignatureAlgorithm.ED448]
+        signature_algorithms: List[SignatureAlgorithm] = certificate_signature_algorithms(self.certificate_private_key)
 
         # negotiate parameters
         cipher_suite = negotiate(

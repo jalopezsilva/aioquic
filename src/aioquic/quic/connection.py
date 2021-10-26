@@ -1266,9 +1266,17 @@ class QuicConnection:
             server_name=self._configuration.server_name,
             verify_mode=self._configuration.verify_mode,
         )
-        self.tls.certificate = self._configuration.certificate
+
+        certificate = self._configuration.certificate
+        private_key = self._configuration.private_key
+
+        if self._is_client:
+            certificate = self._configuration.client_certificate
+            private_key = self._configuration.private_client_cert_key
+
+        self.tls.certificate = certificate
         self.tls.certificate_chain = self._configuration.certificate_chain
-        self.tls.certificate_private_key = self._configuration.private_key
+        self.tls.certificate_private_key = private_key
         self.tls.handshake_extensions = [
             (
                 get_transport_parameters_extension(self._version),

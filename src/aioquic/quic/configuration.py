@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 from os import PathLike
 from re import split
-from typing import Any, List, Optional, TextIO, Union
+from typing import Any, List, Optional, TextIO, Union, Tuple
 
 from ..tls import (
     CipherSuite,
@@ -81,9 +81,11 @@ class QuicConfiguration:
     certificate: Any = None
     certificate_chain: List[Any] = field(default_factory=list)
     cipher_suites: Optional[List[CipherSuite]] = None
+    client_certificate: Any = None
     initial_rtt: float = 0.1
     max_datagram_frame_size: Optional[int] = None
     private_key: Any = None
+    private_client_cert_key: Any = None
     quantum_readiness_test: bool = False
     supported_versions: List[int] = field(
         default_factory=lambda: [
@@ -105,24 +107,57 @@ class QuicConfiguration:
         """
         Load a private key and the corresponding certificate.
         """
+        certificate, private_key, certificate_chain = self._load_cert_and_key(
+            certfile, keyfile, password
+        )
+
+        self.certificate = certificate
+        self.private_key = private_key
+        self.certificate_chain = certificate_chain
+
+    def load_client_cert(
+        self,
+        certfile: PathLike,
+        keyfile: Optional[PathLike] = None,
+        password: Optional[Union[bytes, str]] = None,
+    ):
+        """
+        Load a private key and a corresponding certificate for a client
+        certificate.
+        """
+
+        certificate, private_key, _ = self._load_cert_and_key(
+            certfile, keyfile, password
+        )
+        self.client_certificate = certificate
+        self.private_key = private_key
+
+    def _load_cert_and_key(
+        self,
+        certfile: PathLike,
+        keyfile: Optional[PathLike] = None,
+        password: Optional[Union[bytes, str]] = None,
+    ) -> Tuple[Any, Any, Any]:
+        certificate, private_key, certificate_chain = None
         with open(certfile, "rb") as fp:
             boundary = b"-----BEGIN PRIVATE KEY-----\n"
             chunks = split(b"\n" + boundary, fp.read())
             certificates = load_pem_x509_certificates(chunks[0])
             if len(chunks) == 2:
                 private_key = boundary + chunks[1]
-                self.private_key = load_pem_private_key(private_key)
-        self.certificate = certificates[0]
-        self.certificate_chain = certificates[1:]
+                private_key = load_pem_private_key(private_key)
+        certificate = certificates[0]
+        certificate_chain = certificates[1:]
 
         if keyfile is not None:
             with open(keyfile, "rb") as fp:
-                self.private_key = load_pem_private_key(
+                private_key = load_pem_private_key(
                     fp.read(),
                     password=password.encode("utf8")
                     if isinstance(password, str)
                     else password,
                 )
+        return certificate, private_key, certificate_chain
 
     def load_verify_locations(
         self,
